@@ -1,9 +1,15 @@
 import pandas as pd
-from darts import TimeSeries
-from darts.models import RNNModel, LSTMModel, TransformerModel
-from darts.metrics import mape, rmse, mae
-from sklearn.preprocessing import LabelEncoder
-import matplotlib.pyplot as plt
+from sktime.forecasting.model_selection import temporal_train_test_split
+from sktime.forecasting.compose import make_reduction
+from sktime.forecasting.compose import EnsembleForecaster, StackingForecaster
+from sktime.forecasting.arima import AutoARIMA
+from sktime.forecasting.ets import ExponentialSmoothing
+from sktime.forecasting.theta import ThetaForecaster
+from sktime.forecasting.naive import NaiveForecaster
+from sktime.forecasting.exp_smoothing import ExponentialSmoothing
+from sktime.performance_metrics.forecasting import mean_absolute_percentage_error, mean_squared_error, mean_absolute_error
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.linear_model import LinearRegression
 
 # Load and prepare your data
 # Assuming df_agg_daily is already prepared and cleaned
@@ -11,77 +17,72 @@ df_agg_daily = pd.read_csv("path_to_your_data.csv")  # Replace with your actual 
 df_agg_daily['date'] = pd.to_datetime(df_agg_daily['date'])
 df_agg_daily.set_index('date', inplace=True)
 
-# Encode 'lob_level_1' and 'ir_type' as categorical features
-label_encoder_lob = LabelEncoder()
-label_encoder_ir_type = LabelEncoder()
-df_agg_daily['lob_level_1_encoded'] = label_encoder_lob.fit_transform(df_agg_daily['lob_level_1'])
-df_agg_daily['ir_type_encoded'] = label_encoder_ir_type.fit_transform(df_agg_daily['ir_type'])
-
-# Ensure all features are numeric
-features = ['count', 'year', 'month', 'day_of_week_sin', 'day_of_week_cos', 'month_sin', 'month_cos']
-df_agg_daily[features] = df_agg_daily[features].apply(pd.to_numeric, errors='coerce')
-
-# Convert to Darts TimeSeries
-series = TimeSeries.from_dataframe(df_agg_daily, 'date', 'count')
-feature_series = TimeSeries.from_dataframe(df_agg_daily, 'date', features)
+# Select the target series
+y = df_agg_daily['count']
 
 # Split data into training and testing sets
-train, test = series.split_before(pd.Timestamp("2023-01-01"))
-train_features, test_features = feature_series.split_before(pd.Timestamp("2023-01-01"))
+y_train, y_test = temporal_train_test_split(y, test_size=365)
 
 # Define the models
-rnn_model = RNNModel(input_chunk_length=12, output_chunk_length=6, n_rnn_layers=2, model="RNN", random_state=42)
-lstm_model = LSTMModel(input_chunk_length=12, output_chunk_length=6, n_rnn_layers=2, random_state=42)
-transformer_model = TransformerModel(input_chunk_length=12, output_chunk_length=6, random_state=42)
+forecasters = [
+    ("AutoARIMA", AutoARIMA()),
+    ("ETS", ExponentialSmoothing(trend="add", seasonal="add", sp=12)),
+    ("Theta", ThetaForecaster(sp=12)),
+    ("SeasonalNaive", NaiveForecaster(strategy="seasonal_last", sp=12)),
+    ("RandomForest", make_reduction(RandomForestRegressor(), window_length=12, strategy="recursive")),
+    ("LinearRegression", make_reduction(LinearRegression(), window_length=12, strategy="recursive"))
+]
 
-# Train the models
-rnn_model.fit([train], future_covariates=[train_features], epochs=100)
-lstm_model.fit([train], future_covariates=[train_features], epochs=100)
-transformer_model.fit([train], future_covariates=[train_features], epochs=100)
+# Ensemble forecaster
+ensemble_forecaster = EnsembleForecaster(forecasters)
+
+# Stacking forecaster
+stacking_forecaster = StackingForecaster(forecasters)
+
+# Fit the models
+ensemble_forecaster.fit(y_train)
+stacking_forecaster.fit(y_train)
 
 # Predict
-rnn_forecast = rnn_model.predict(n=len(test), future_covariates=test_features)
-lstm_forecast = lstm_model.predict(n=len(test), future_covariates=test_features)
-transformer_forecast = transformer_model.predict(n=len(test), future_covariates=test_features)
+y_pred_ensemble = ensemble_forecaster.predict(fh=len(y_test))
+y_pred_stacking = stacking_forecaster.predict(fh=len(y_test))
 
 # Collect metrics
 metrics = {
-    "Model": ["RNN", "LSTM", "Transformer"],
+    "Model": ["Ensemble", "Stacking"],
     "MAPE": [
-        mape(test, rnn_forecast),
-        mape(test, lstm_forecast),
-        mape(test, transformer_forecast)
+        mean_absolute_percentage_error(y_test, y_pred_ensemble),
+        mean_absolute_percentage_error(y_test, y_pred_stacking)
     ],
     "RMSE": [
-        rmse(test, rnn_forecast),
-        rmse(test, lstm_forecast),
-        rmse(test, transformer_forecast)
+        mean_squared_error(y_test, y_pred_ensemble, squared=False),
+        mean_squared_error(y_test, y_pred_stacking, squared=False)
     ],
     "MAE": [
-        mae(test, rnn_forecast),
-        mae(test, lstm_forecast),
-        mae(test, transformer_forecast)
+        mean_absolute_error(y_test, y_pred_ensemble),
+        mean_absolute_error(y_test, y_pred_stacking)
     ]
 }
 metrics_df = pd.DataFrame(metrics)
 
 # Collect forecasts
 forecasts_df = pd.DataFrame({
-    "Date": test.time_index,
-    "Actual": test.values().flatten(),
-    "RNN_Forecast": rnn_forecast.values().flatten(),
-    "LSTM_Forecast": lstm_forecast.values().flatten(),
-    "Transformer_Forecast": transformer_forecast.values().flatten()
+    "Date": y_test.index,
+    "Actual": y_test.values,
+    "Ensemble_Forecast": y_pred_ensemble.values,
+    "Stacking_Forecast": y_pred_stacking.values
 })
 
 # Print metrics
 print(metrics_df)
 
 # Plot forecasts
+import matplotlib.pyplot as plt
+
 plt.figure(figsize=(10, 6))
-series.plot(label="Actual")
-rnn_forecast.plot(label="RNN Forecast")
-lstm_forecast.plot(label="LSTM Forecast")
-transformer_forecast.plot(label="Transformer Forecast")
+y_train.plot(label="Training Data")
+y_test.plot(label="Actual")
+y_pred_ensemble.plot(label="Ensemble Forecast")
+y_pred_stacking.plot(label="Stacking Forecast")
 plt.legend()
 plt.show()
